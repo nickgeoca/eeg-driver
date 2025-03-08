@@ -1,0 +1,28 @@
+[package]
+name = "eeg_driver"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "eeg_driver"
+path = "src/lib.rs"
+
+[[bin]]
+name = "eeg_driver_bin"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.28.0", features = ["macros", "rt-multi-thread", "sync", "time"] }
+rand = "0.8"
+libc = "0.2"
+nix = "0.26"
+clap = { version = "4.5", features = ["derive"] } # for passing the mock data flag
+rppal = { version = "0.14", features = ["hal"] }
+aligned-utils = "1.0"
+biquad = "0.5"
+rustfft = "6.1"
+rand_distr = "0.4"
+thiserror = "1.0"
+async-trait = "0.1.68"
+log = "0.4"
+futures = "0.3"
