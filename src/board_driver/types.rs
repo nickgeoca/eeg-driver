@@ -32,7 +32,20 @@ pub struct AdcConfig {
     pub gain: f32,
     pub channels: Vec<usize>,
     pub mock: bool,
+    pub batch_size: usize,  // Number of samples to collect in a batch
     // Add other configuration parameters as needed
+}
+
+impl Default for AdcConfig {
+    fn default() -> Self {
+        Self {
+            sample_rate: 250,  // 250 Hz is a common EEG sampling rate
+            gain: 1.0,
+            channels: vec![0],
+            mock: true,
+            batch_size: 32,    // Default batch size (typical SPI buffer size)
+        }
+    }
 }
 
 // ADC data point
@@ -97,11 +110,10 @@ pub enum DriverType {
 
 #[async_trait]
 pub trait AdcDriver: Send + Sync + 'static {
-    async fn reset_and_start(&mut self, config: AdcConfig) -> Result<(), DriverError>;
-    async fn shutdown(&mut self) -> Result<(), DriverError>;
-
     async fn start_acquisition(&mut self) -> Result<(), DriverError>;
     async fn stop_acquisition(&mut self) -> Result<(), DriverError>;
+    
+    async fn shutdown(&mut self) -> Result<(), DriverError>;
 
     fn get_status(&self) -> DriverStatus;
     fn get_config(&self) -> Result<AdcConfig, DriverError>;
@@ -124,7 +136,7 @@ pub async fn create_driver(driver_type: DriverType, config: AdcConfig)
         //     Ok((Box::new(driver), events))
         // },
         DriverType::Mock => {
-            let (mut driver, events) = super::mock_driver::MockDriver::new()?;
+            let (mut driver, events) = super::mock_driver::MockDriver::new(config, 0)?;
             Ok((Box::new(driver), events))
         }
     }
