@@ -3,7 +3,7 @@ mod board_driver;
 use tokio;
 use std::error::Error;
 use clap::Parser;
-use eeg_driver::{AdcConfig, EegSystem};
+use eeg_driver::{AdcConfig, EegSystem, DriverType};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -30,7 +30,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         sample_rate: 250,
         channels: vec![0, 1, 2, 3],
         gain: 24.0,
-        mock: true,
+        board_driver: DriverType::Mock,
+        batch_size: 32,
     };
 
     // Create the EEG system (using mock driver)

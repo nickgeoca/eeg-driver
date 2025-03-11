@@ -5,9 +5,10 @@ pub mod eeg_system;
 // Re-export the main types that users need
 pub use eeg_system::EegSystem;
 pub use board_driver::types::{AdcConfig, DriverType, DriverStatus};
+use serde::{Serialize, Deserialize};
 
 /// Processed EEG data structure
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProcessedData {
     pub data: Vec<Vec<f32>>,
     pub timestamp: u64,

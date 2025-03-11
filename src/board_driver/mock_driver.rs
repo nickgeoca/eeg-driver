@@ -1,10 +1,16 @@
-use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 use async_trait::async_trait;
 use log::{info, warn, debug, trace, error};
-use super::types::{AdcConfig, AdcData, DriverStatus, DriverError, DriverEvent};
+use lazy_static::lazy_static;
+use super::types::{AdcConfig, AdcData, DriverStatus, DriverError, DriverEvent, DriverType};
+
+// Static hardware lock to simulate real hardware access constraints
+lazy_static! {
+    static ref HARDWARE_LOCK: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+}
 
 /// A stubbed-out driver that does not access any hardware.
 pub struct MockDriver {
@@ -16,7 +22,7 @@ pub struct MockDriver {
 
 /// Internal state for the MockDriver.
 struct MockInner {
-    config: Option<AdcConfig>,
+    config: AdcConfig,
     running: bool,
     status: DriverStatus,
 }
@@ -48,28 +54,46 @@ impl MockDriver {
     /// # Important
     /// Users should explicitly call `shutdown()` when done with the driver to ensure proper cleanup.
     /// While the Drop implementation provides some basic cleanup, it cannot perform the full async shutdown sequence.
+    /// Don't start buffer data in new
     ///
     /// # Returns
     /// A tuple containing the driver instance and a receiver for driver events.
     ///
     /// # Errors
     /// Returns an error if:
-    /// - config.mock is false (MockDriver requires mock=true)
+    /// - config.board_driver is not DriverType::Mock
     /// - config.batch_size is 0 (batch size must be positive)
     /// - config.batch_size is less than the number of channels (need at least one sample per channel)
     pub fn new(
         config: AdcConfig,
         additional_channel_buffering: usize
     ) -> Result<(Self, mpsc::Receiver<DriverEvent>), DriverError> {
+        // Try to acquire the hardware lock to simulate real hardware access constraints
+        let mut hardware_in_use = HARDWARE_LOCK.lock()
+            .map_err(|_| DriverError::Other("Failed to acquire hardware lock".to_string()))?;
+            
+        if *hardware_in_use {
+            return Err(DriverError::HardwareNotFound(
+                "Hardware already in use by another driver instance".to_string()
+            ));
+        }
+        
+        // Mark hardware as in use
+        *hardware_in_use = true;
+        
         // Validate config
-        if !config.mock {
+        if config.board_driver != DriverType::Mock {
+            // Release the lock if we're returning an error
+            *hardware_in_use = false;
             return Err(DriverError::ConfigurationError(
-                "MockDriver requires config.mock=true".to_string()
+                "MockDriver requires config.board_driver=DriverType::Mock".to_string()
             ));
         }
         
         // Validate batch size
         if config.batch_size == 0 {
+            // Release the lock if we're returning an error
+            *hardware_in_use = false;
             return Err(DriverError::ConfigurationError(
                 "Batch size must be greater than 0".to_string()
             ));
@@ -77,6 +101,8 @@ impl MockDriver {
         
         // Validate batch size relative to channel count
         if config.batch_size < config.channels.len() {
+            // Release the lock if we're returning an error
+            *hardware_in_use = false;
             return Err(DriverError::ConfigurationError(
                 format!("Batch size ({}) must be at least equal to the number of channels ({})",
                         config.batch_size, config.channels.len())
@@ -87,6 +113,8 @@ impl MockDriver {
         const MAX_BUFFER_SIZE: usize = 10000; // Arbitrary limit to prevent excessive memory usage
         let channel_buffer_size = config.batch_size + additional_channel_buffering;
         if channel_buffer_size > MAX_BUFFER_SIZE {
+            // Release the lock if we're returning an error
+            *hardware_in_use = false;
             return Err(DriverError::ConfigurationError(
                 format!("Total buffer size ({}) exceeds maximum allowed ({})",
                         channel_buffer_size, MAX_BUFFER_SIZE)
@@ -94,7 +122,7 @@ impl MockDriver {
         }
         
         let inner = MockInner {
-            config: Some(config.clone()),
+            config: config.clone(),
             running: false,
             status: DriverStatus::Ok,
         };
@@ -117,12 +145,9 @@ impl MockDriver {
     }
     
     /// Return the current configuration.
-    ///
-    /// Returns an error if the driver has not been configured.
-    pub(crate) fn get_config(&self) -> Result<AdcConfig, DriverError> {
-        let inner = self.inner.lock().map_err(|_|
-            DriverError::Other("Failed to acquire lock on driver state".to_string()))?;
-        inner.config.clone().ok_or(DriverError::NotConfigured)
+    pub(crate) async fn get_config(&self) -> Result<AdcConfig, DriverError> {
+        let inner = self.inner.lock().await;
+        Ok(inner.config.clone())
     }
 
     /// Start a dummy acquisition task that sends fake data at regular intervals.
@@ -132,21 +157,16 @@ impl MockDriver {
     pub(crate) async fn start_acquisition(&mut self) -> Result<(), DriverError> {
         // Check preconditions without holding the lock for too long
         {
-            let inner = self.inner.lock().map_err(|_|
-                DriverError::Other("Failed to acquire lock on driver state".to_string()))?;
+            let inner = self.inner.lock().await;
                 
             if inner.running {
                 return Err(DriverError::ConfigurationError("Acquisition already running".to_string()));
-            }
-            if inner.config.is_none() {
-                return Err(DriverError::NotConfigured);
             }
         }
         
         // Update state to running
         {
-            let mut inner = self.inner.lock().map_err(|_|
-                DriverError::Other("Failed to acquire lock on driver state".to_string()))?;
+            let mut inner = self.inner.lock().await;
             inner.running = true;
             inner.status = DriverStatus::Running;
         }
@@ -162,18 +182,8 @@ impl MockDriver {
         let handle = tokio::spawn(async move {
             // Get configuration without holding the lock for the entire task
             let config = {
-                let inner = inner_arc.lock().map_err(|e| {
-                    error!("Failed to acquire lock: {:?}", e);
-                    return;
-                }).unwrap();
-                
-                match inner.config.clone() {
-                    Some(cfg) => cfg,
-                    None => {
-                        error!("Configuration missing in acquisition task");
-                        return;
-                    }
-                }
+                let inner = inner_arc.lock().await;
+                inner.config.clone()
             };
             
             // Get batch size from config
@@ -192,28 +202,24 @@ impl MockDriver {
                    batch_size, config.sample_rate);
             
             // Main acquisition loop
-            while let Ok(inner) = inner_arc.lock() {
-                if !inner.running {
-                    break;
-                }
-                
-                // Get the latest config (in case it was reconfigured)
-                let current_config = match inner.config.clone() {
-                    Some(cfg) => cfg,
-                    None => {
-                        error!("Configuration missing during acquisition");
-                        break;
+            loop {
+                // Check if we should continue running
+                let should_continue = {
+                    let inner = inner_arc.lock().await;
+                    if !inner.running {
+                        false
+                    } else {
+                        true
                     }
                 };
                 
-                // Get the current batch size (may have changed due to reconfiguration)
-                let current_batch_size = current_config.batch_size;
-                
-                drop(inner); // Release the lock before time-consuming operations
+                if !should_continue {
+                    break;
+                }
                 
                 // Calculate timing parameters
-                let mut batch = Vec::with_capacity(current_batch_size);
-                let sample_interval = (1_000_000 / current_config.sample_rate) as u64; // microseconds between samples
+                let mut batch = Vec::with_capacity(batch_size);
+                let sample_interval = (1_000_000 / config.sample_rate) as u64; // microseconds between samples
                 debug!("Sample interval: {} microseconds", sample_interval);
                 
                 // Get current timestamp relative to start time
@@ -226,10 +232,10 @@ impl MockDriver {
                 };
                 
                 // Generate a batch of samples with incrementing timestamps
-                for i in 0..current_batch_size {
+                for i in 0..batch_size {
                     let relative_timestamp = base_timestamp + i as u64 * sample_interval;
                     trace!("Sample {}: relative_time={} microseconds", i, relative_timestamp);
-                    let sample = test_data(&current_config, relative_timestamp);
+                    let sample = test_data(&config, relative_timestamp);
                     batch.push(sample);
                 }
                 
@@ -240,7 +246,7 @@ impl MockDriver {
                 }
                 
                 // Sleep for the time it would take to collect this batch via SPI
-                let sleep_time = (1000 * current_batch_size as u64) / current_config.sample_rate as u64;
+                let sleep_time = (1000 * batch_size as u64) / config.sample_rate as u64;
                 debug!("Sleeping for {} ms before next batch", sleep_time);
                 sleep(Duration::from_millis(sleep_time)).await;
             }
@@ -260,8 +266,7 @@ impl MockDriver {
     pub(crate) async fn stop_acquisition(&mut self) -> Result<(), DriverError> {
         // Signal the acquisition task to stop
         {
-            let mut inner = self.inner.lock().map_err(|_|
-                DriverError::Other("Failed to acquire lock on driver state".to_string()))?;
+            let mut inner = self.inner.lock().await;
             
             if !inner.running {
                 debug!("Stop acquisition called, but acquisition was not running");
@@ -282,8 +287,7 @@ impl MockDriver {
         
         // Update driver status
         {
-            let mut inner = self.inner.lock().map_err(|_|
-                DriverError::Other("Failed to acquire lock on driver state".to_string()))?;
+            let mut inner = self.inner.lock().await;
             inner.status = DriverStatus::Stopped;
         }
         
@@ -296,15 +300,9 @@ impl MockDriver {
     /// Return the current driver status.
     ///
     /// This method returns the current status of the driver.
-    /// If the lock cannot be acquired, it returns NotInitialized status.
-    pub(crate) fn get_status(&self) -> DriverStatus {
-        match self.inner.lock() {
-            Ok(inner) => inner.status,
-            Err(e) => {
-                error!("Failed to acquire lock when getting status: {:?}", e);
-                DriverStatus::NotInitialized
-            }
-        }
+    pub(crate) async fn get_status(&self) -> DriverStatus {
+        let inner = self.inner.lock().await;
+        inner.status
     }
 
     /// Shut down the driver.
@@ -320,14 +318,8 @@ impl MockDriver {
         
         // First check if running, but don't hold the lock
         let should_stop = {
-            match self.inner.lock() {
-                Ok(inner) => inner.running,
-                Err(e) => {
-                    error!("Failed to acquire lock during shutdown: {:?}", e);
-                    // Assume we need to stop acquisition to be safe
-                    true
-                }
-            }
+            let inner = self.inner.lock().await;
+            inner.running
         };
         
         // Stop acquisition if needed
@@ -338,10 +330,9 @@ impl MockDriver {
 
         // Update final state
         {
-            let mut inner = self.inner.lock().map_err(|_|
-                DriverError::Other("Failed to acquire lock on driver state".to_string()))?;
+            let mut inner = self.inner.lock().await;
             inner.status = DriverStatus::NotInitialized;
-            inner.config = None;
+            // Config is now static, so we don't need to reset it
         }
         
         // Notify about the status change
@@ -354,16 +345,10 @@ impl MockDriver {
     ///
     /// This method sends a status change event to any listeners.
     async fn notify_status_change(&self) -> Result<(), DriverError> {
-        // Get current status with proper error handling
+        // Get current status
         let status = {
-            match self.inner.lock() {
-                Ok(inner) => inner.status,
-                Err(e) => {
-                    return Err(DriverError::Other(
-                        format!("Failed to acquire lock for status notification: {:?}", e)
-                    ));
-                }
-            }
+            let inner = self.inner.lock().await;
+            inner.status
         };
         
         debug!("Sending status change notification: {:?}", status);
@@ -424,12 +409,12 @@ impl super::types::AdcDriver for MockDriver {
         self.stop_acquisition().await
     }
 
-    fn get_status(&self) -> DriverStatus {
-        self.get_status()
+    async fn get_status(&self) -> DriverStatus {
+        self.get_status().await
     }
 
-    fn get_config(&self) -> Result<AdcConfig, DriverError> {
-        self.get_config()
+    async fn get_config(&self) -> Result<AdcConfig, DriverError> {
+        self.get_config().await
     }
 }
 
@@ -440,36 +425,25 @@ impl super::types::AdcDriver for MockDriver {
 /// cannot perform the full async shutdown sequence because Drop is not async.
 impl Drop for MockDriver {
     fn drop(&mut self) {
-        // Get the current status with proper error handling
-        let status = match self.inner.lock() {
-            Ok(inner) => inner.status,
-            Err(e) => {
-                error!("Failed to acquire lock in Drop implementation: {:?}", e);
-                // Assume we need to clean up
-                DriverStatus::Running
-            }
-        };
+        // Since we can't use .await in Drop, we'll just log a warning
+        error!("MockDriver dropped without calling shutdown() first. This may lead to resource leaks.");
+        error!("Always call driver.shutdown().await before dropping the driver.");
         
-        // If the driver wasn't properly shut down, attempt to clean up
-        if status != DriverStatus::NotInitialized {
-            error!("MockDriver dropped without calling shutdown() first. This may lead to resource leaks.");
-            error!("Always call driver.shutdown().await before dropping the driver.");
-            
-            // Try to stop any running acquisition
-            if let Ok(mut inner) = self.inner.lock() {
-                inner.running = false;
-                inner.status = DriverStatus::NotInitialized;
-                inner.config = None;
-                debug!("Basic cleanup performed in Drop implementation");
-            } else {
-                error!("Failed to acquire lock for cleanup in Drop implementation");
-            }
-            
-            // Note: We cannot await the task_handle here because Drop is not async.
-            // This is why users should call shutdown() explicitly.
-            if self.task_handle.is_some() {
-                error!("Background task may still be running. Call shutdown() to properly terminate it.");
-            }
+        // Note: We can't properly clean up in Drop because we can't use .await
+        // This is why users should call shutdown() explicitly.
+        
+        // Note: We cannot await the task_handle here because Drop is not async.
+        // This is why users should call shutdown() explicitly.
+        if self.task_handle.is_some() {
+            error!("Background task may still be running. Call shutdown() to properly terminate it.");
+        }
+        
+        // Release the hardware lock
+        if let Ok(mut lock) = HARDWARE_LOCK.lock() {
+            *lock = false;
+            debug!("Hardware lock released in Drop implementation");
+        } else {
+            error!("Failed to release hardware lock in Drop implementation");
         }
     }
 }

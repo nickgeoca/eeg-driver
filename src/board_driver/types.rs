@@ -5,10 +5,11 @@ use tokio::sync::mpsc;
 use std::future::Future;
 use std::pin::Pin;
 use async_trait::async_trait;
+use serde::{Serialize, Deserialize};
 use super::mock_driver::MockDriver;
 
 // Driver events
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DriverEvent {
     Data(Vec<AdcData>),
     Error(String),
@@ -16,7 +17,7 @@ pub enum DriverEvent {
 }
 
 // Driver status
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum DriverStatus {
     NotInitialized,
     Ok,
@@ -25,13 +26,20 @@ pub enum DriverStatus {
     Running,
 }
 
+// Fix DriverType enum to match create_driver usage
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum DriverType {
+    Ads1299,
+    Mock,
+}
+
 // ADC configuration
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdcConfig {
     pub sample_rate: u32,
     pub gain: f32,
     pub channels: Vec<usize>,
-    pub mock: bool,
+    pub board_driver: DriverType,
     pub batch_size: usize,  // Number of samples to collect in a batch
     // Add other configuration parameters as needed
 }
@@ -42,14 +50,14 @@ impl Default for AdcConfig {
             sample_rate: 250,  // 250 Hz is a common EEG sampling rate
             gain: 1.0,
             channels: vec![0],
-            mock: true,
+            board_driver: DriverType::Mock,
             batch_size: 32,    // Default batch size (typical SPI buffer size)
         }
     }
 }
 
 // ADC data point
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdcData {
     pub samples: Vec<Vec<f32>>,
     pub timestamp: u64,
@@ -100,13 +108,6 @@ impl From<TimeError> for DriverError {
     }
 }
 
-// Fix DriverType enum to match create_driver usage
-#[derive(Debug, Clone, Copy)]
-pub enum DriverType {
-    // Ads1299,
-    Mock,
-}
-
 
 #[async_trait]
 pub trait AdcDriver: Send + Sync + 'static {
@@ -115,15 +116,15 @@ pub trait AdcDriver: Send + Sync + 'static {
     
     async fn shutdown(&mut self) -> Result<(), DriverError>;
 
-    fn get_status(&self) -> DriverStatus;
-    fn get_config(&self) -> Result<AdcConfig, DriverError>;
+    async fn get_config(&self) -> Result<AdcConfig, DriverError>;
+    async fn get_status(&self) -> DriverStatus;
 }
 
-// Updated factory function to create the appropriate driver and return the event channel
-pub async fn create_driver(driver_type: DriverType, config: AdcConfig) 
+// Factory function to create the appropriate driver and return the event channel
+pub async fn create_driver(config: AdcConfig)
     -> Result<(Box<dyn AdcDriver>, mpsc::Receiver<DriverEvent>), DriverError> {
     
-    match driver_type {
+    match config.board_driver {
         // DriverType::Ads1299 => {
         //     // Create the ADS1299 hardware driver
         //     let (driver, events) = crate::adc::ads1299_driver::Ads1299Driver::new(config).map_err(|e| DriverError::Other(e.to_string()))?;
@@ -135,8 +136,11 @@ pub async fn create_driver(driver_type: DriverType, config: AdcConfig)
             
         //     Ok((Box::new(driver), events))
         // },
+        DriverType::Ads1299 => {
+            panic!("no Ads1299 drver yet")
+        }
         DriverType::Mock => {
-            let (mut driver, events) = super::mock_driver::MockDriver::new(config, 0)?;
+            let (driver, events) = super::mock_driver::MockDriver::new(config, 0)?;
             Ok((Box::new(driver), events))
         }
     }

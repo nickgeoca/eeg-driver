@@ -23,13 +23,7 @@ impl EegSystem {
     pub async fn new(
         config: AdcConfig
     ) -> Result<(Self, mpsc::Receiver<ProcessedData>), Box<dyn Error>> {
-        let driver_type = if config.mock {
-            DriverType::Mock // DriverType::Ads1299
-        } else {
-            DriverType::Mock
-        };
-        
-        let (driver, event_rx) = create_driver(driver_type, config.clone()).await?;
+        let (driver, event_rx) = create_driver(config.clone()).await?;
         let processor = Arc::new(Mutex::new(SignalProcessor::new(
             config.sample_rate,
             config.channels.len(),
@@ -78,8 +72,6 @@ impl EegSystem {
             proc_guard.reset(config.sample_rate, config.channels.len());
         }
 
-        // Initialize and start the driver
-        self.driver.reset_and_start(config).await?;
         self.driver.start_acquisition().await?;
 
         // Take ownership of the event receiver
@@ -154,13 +146,13 @@ impl EegSystem {
     }
 
     /// Retrieve the current driver status
-    pub fn driver_status(&self) -> DriverStatus {
-        self.driver.get_status()
+    pub async fn driver_status(&self) -> DriverStatus {
+        self.driver.get_status().await
     }
 
     /// Retrieve the driver's configuration
-    pub fn driver_config(&self) -> Result<AdcConfig, DriverError> {
-        self.driver.get_config()
+    pub async fn driver_config(&self) -> Result<AdcConfig, DriverError> {
+        self.driver.get_config().await
     }
 
     /// Optionally allow direct driver access
@@ -193,8 +185,8 @@ impl EegSystem {
 
 impl Drop for EegSystem {
     fn drop(&mut self) {
-        if self.driver.get_status() != DriverStatus::NotInitialized {
-            eprintln!("Warning: EegSystem dropped without calling shutdown() first");
-        }
+        // Since we can't use .await in Drop, we'll just log a warning
+        eprintln!("Warning: EegSystem dropped without calling shutdown() first");
+        eprintln!("Always call system.shutdown().await before dropping the system");
     }
 }
